@@ -1,36 +1,52 @@
+const { Client } = require('pg');
 const prisma = require('../configs/db');
 
 class ProjectService {
-    /**
-     * Create or retrieve a project by name.
-     * Ensures the associated user exists (mocked for now).
-     */
-    async createProject(name, description, username) {
-        // Check/Create User (Mock Auth)
+
+    async createProject(name, description, username, targetDbUrl) {
+        // Find user — if not found, throw a clear error instead of trying to create
+        // a broken user record. The user must exist (they're authenticated via JWT).
         let user = await prisma.user.findFirst({ where: { username } });
+
         if (!user) {
+            // This means the user authenticated successfully (valid JWT) but their
+            // DB record was deleted. Re-create them with a placeholder email.
             user = await prisma.user.create({
-                data: { username, password: 'password' }
+                data: {
+                    username,
+                    email: `${username}@github.placeholder`,  // email is required in schema
+                    password: null
+                }
             });
+            console.warn(`[ProjectService] Re-created missing user record for: ${username}`);
         }
 
-        // Upsert Project (Create if doesn't exist, update if it does)
+        // Upsert project — update if exists, create if not
         const project = await prisma.project.upsert({
             where: { name },
-            update: { description },
+            update: {
+                description,
+                ...(targetDbUrl && { targetDbUrl }),
+                userId: user.id  // re-link in case user was re-created
+            },
             create: {
                 name,
                 description,
+                targetDbUrl,
                 userId: user.id
             }
+        });
+
+        // Ensure default 'main' branch exists
+        await prisma.branch.upsert({
+            where: { projectId_name: { projectId: project.id, name: 'main' } },
+            update: {},
+            create: { name: 'main', projectId: project.id }
         });
 
         return project;
     }
 
-    /**
-     * Find a project by name, including branches.
-     */
     async getProjectByName(name) {
         return prisma.project.findUnique({
             where: { name },
@@ -38,25 +54,16 @@ class ProjectService {
         });
     }
 
-    /**
-     * Create a commit for a project.
-     */
     async createCommit(projectName, { message, snapshot, diff, prevCommitId, branchName, author }) {
         const project = await prisma.project.findUnique({ where: { name: projectName } });
-        if (!project) throw new Error('Project not found');
+        if (!project) throw new Error(`Project "${projectName}" not found`);
 
-        // Handle Branch
-        let branch = await prisma.branch.findUnique({
-            where: { projectId_name: { projectId: project.id, name: branchName || 'main' } }
+        const branch = await prisma.branch.upsert({
+            where: { projectId_name: { projectId: project.id, name: branchName || 'main' } },
+            update: {},
+            create: { name: branchName || 'main', projectId: project.id }
         });
 
-        if (!branch) {
-            branch = await prisma.branch.create({
-                data: { name: branchName || 'main', projectId: project.id }
-            });
-        }
-
-        // Create Commit
         const commit = await prisma.commit.create({
             data: {
                 message,
@@ -65,11 +72,10 @@ class ProjectService {
                 diff,
                 projectId: project.id,
                 branchId: branch.id,
-                prevCommitId: prevCommitId || branch.headCommitId
+                prevCommitId: prevCommitId || branch.headCommitId || null
             }
         });
 
-        // Update Branch Head
         await prisma.branch.update({
             where: { id: branch.id },
             data: { headCommitId: commit.id }
@@ -78,32 +84,22 @@ class ProjectService {
         return commit;
     }
 
-    /**
-     * Get the latest commit for a project/branch.
-     */
     async getLatestCommit(projectName, branchName = 'main') {
         const project = await prisma.project.findUnique({ where: { name: projectName } });
-        if (!project) throw new Error('Project not found');
+        if (!project) return null;
 
         const branch = await prisma.branch.findUnique({
             where: { projectId_name: { projectId: project.id, name: branchName } }
         });
 
-        if (!branch || !branch.headCommitId) {
-            return null;
-        }
+        if (!branch || !branch.headCommitId) return null;
 
-        return prisma.commit.findUnique({
-            where: { id: branch.headCommitId }
-        });
+        return prisma.commit.findUnique({ where: { id: branch.headCommitId } });
     }
 
-    /**
-     * Get commit history for a project.
-     */
     async getCommitLog(projectName, limit = 20) {
         const project = await prisma.project.findUnique({ where: { name: projectName } });
-        if (!project) throw new Error('Project not found');
+        if (!project) throw new Error(`Project "${projectName}" not found`);
 
         return prisma.commit.findMany({
             where: { projectId: project.id },
@@ -112,15 +108,95 @@ class ProjectService {
         });
     }
 
-    /**
-     * Get a specific commit by ID.
-     */
     async getCommitById(projectName, commitId) {
-        // confirm project exists first
         const project = await prisma.project.findUnique({ where: { name: projectName } });
-        if (!project) throw new Error('Project not found');
+        if (!project) throw new Error(`Project "${projectName}" not found`);
 
-        return prisma.commit.findUnique({ where: { id: commitId } });
+        return prisma.commit.findFirst({
+            where: {
+                projectId: project.id,
+                id: { startsWith: commitId }
+            }
+        });
+    }
+
+    async rollbackProject(projectName, commitId) {
+        console.log('🔍 Rolling back:', projectName, 'to commit:', commitId);
+
+        const project = await prisma.project.findUnique({ where: { name: projectName } });
+        if (!project) throw new Error(`Project "${projectName}" not found`);
+
+        if (!project.targetDbUrl) {
+            throw new Error(`No target DB URL configured for "${projectName}". Re-run "dbv init" with the -d flag.`);
+        }
+
+        // Support short commit IDs
+        const commit = await prisma.commit.findFirst({
+            where: { id: { startsWith: commitId } }
+        });
+        if (!commit) throw new Error(`Commit "${commitId}" not found`);
+
+        const snapshot = commit.snapshot;
+        if (!snapshot || !snapshot.tables) {
+            throw new Error('Commit snapshot is empty or malformed');
+        }
+
+        const client = new Client({ connectionString: project.targetDbUrl });
+        await client.connect();
+        console.log('✅ Connected to target DB');
+
+        try {
+            await client.query('BEGIN');
+
+            // Drop all existing public tables
+            const { rows: existingTables } = await client.query(`
+                SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+            `);
+            for (const { tablename } of existingTables) {
+                await client.query(`DROP TABLE IF EXISTS "${tablename}" CASCADE`);
+            }
+
+            // Recreate tables from snapshot
+            for (const [tableName, tableDef] of Object.entries(snapshot.tables)) {
+                if (tableName === '_prisma_migrations') continue;
+
+                if (!tableDef.columns || Object.keys(tableDef.columns).length === 0) {
+                    console.warn(`⚠️  Skipping table "${tableName}" — no columns in snapshot`);
+                    continue;
+                }
+
+                const columns = Object.entries(tableDef.columns)
+                    .map(([colName, colDef]) => `"${colName}" ${colDef.type}`)
+                    .join(', ');
+
+                console.log(`📋 Creating table: ${tableName}`);
+                await client.query(`CREATE TABLE "${tableName}" (${columns})`);
+
+                // Restore rows if snapshot includes data
+                if (tableDef.rows && tableDef.rows.length > 0) {
+                    for (const row of tableDef.rows) {
+                        const cols = Object.keys(row).map(c => `"${c}"`).join(', ');
+                        const vals = Object.values(row).map((_, i) => `$${i + 1}`).join(', ');
+                        const values = Object.values(row);
+                        await client.query(
+                            `INSERT INTO "${tableName}" (${cols}) VALUES (${vals})`,
+                            values
+                        );
+                    }
+                    console.log(`📥 Restored ${tableDef.rows.length} rows into "${tableName}"`);
+                }
+            }
+
+            await client.query('COMMIT');
+            console.log('✅ Rollback committed successfully');
+
+        } catch (err) {
+            await client.query('ROLLBACK');
+            console.error('❌ Rollback failed, transaction rolled back:', err.message);
+            throw err;
+        } finally {
+            await client.end();
+        }
     }
 }
 

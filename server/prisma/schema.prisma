@@ -12,7 +12,7 @@ model User {
   username  String    @unique
   email     String    @unique
   githubId  String?   @unique
-  password  String? // Optional for OAuth users
+  password  String?
   projects  Project[]
   createdAt DateTime  @default(now())
 }
@@ -21,6 +21,7 @@ model Project {
   id          Int      @id @default(autoincrement())
   name        String   @unique
   description String?
+  targetDbUrl String?
   userId      Int
   user        User     @relation(fields: [userId], references: [id])
   commits     Commit[]
@@ -51,7 +52,7 @@ model Commit {
   branchId  Int?
   branch    Branch?  @relation(fields: [branchId], references: [id])
 
-  snapshot Json // Full Schema Snapshot
+  snapshot Json
   diff     Json?
 
   prevCommitId String?

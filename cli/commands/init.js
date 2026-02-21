@@ -1,6 +1,5 @@
 const inquirer = require('inquirer').default;
 const chalk = require('chalk');
-const axios = require('axios');
 const configManager = require('../utils/config');
 const apiService = require('../services/api');
 
@@ -45,29 +44,35 @@ module.exports = async function init(name, options) {
     const targetDbUrl = options.database || answers.targetDbUrl;
     const apiUrl = options.remote || 'http://localhost:3000';
 
+    const globalConfig = configManager.getGlobalConfig();
+    if (!globalConfig || !globalConfig.token) {
+        console.error(chalk.red('\n✖ You are not logged in. Please run "dbv login" first.'));
+        process.exit(1);
+    }
+
     try {
-        // Test backend connection
+        await apiService.init(apiUrl);
         console.log(chalk.yellow(`Connecting to remote server at ${apiUrl}...`));
-        const api = axios.create({ baseURL: apiUrl });
-        const response = await api.post('/projects', {
-            name: projectName,
-            description: 'Initialized via CLI'
-        });
+
+        const response = await apiService.createProject(projectName, 'Initialized via CLI', targetDbUrl);  // ✅ pass targetDbUrl
 
         if (response.data.success) {
             configManager.saveConfig({
-                projectName: projectName,
-                targetDbUrl: targetDbUrl,
-                apiUrl: apiUrl,
+                projectName,
+                targetDbUrl,
+                apiUrl,
                 remoteOrigin: apiUrl
             });
-            console.log(chalk.green('\n✓ Project successfully initialized and linked to remote!'));
+            console.log(chalk.green('\n✔ Project successfully initialized and linked to remote!'));
         }
     } catch (error) {
         console.error(chalk.red('\n✖ Initialization failed.'));
         console.error(chalk.red(`Error: ${error.message}`));
         if (error.code === 'ECONNREFUSED') {
             console.log(chalk.yellow('Hint: Is the backend server running?'));
+        }
+        if (error.response?.status === 401) {
+            console.log(chalk.yellow('Hint: Your session may have expired. Run "dbv login" again.'));
         }
     }
 };

@@ -1,12 +1,13 @@
 const projectService = require('../services/projectService');
 
 class ProjectController {
+
     async createProject(req, res) {
-        const { name, description } = req.body;
-        const username = req.user.username; // From mock auth middleware
+        const { name, description, targetDbUrl } = req.body;  // ✅ extract targetDbUrl
+        const username = req.user.username;
 
         try {
-            const project = await projectService.createProject(name, description, username);
+            const project = await projectService.createProject(name, description, username, targetDbUrl);  // ✅ pass it
             res.status(201).json({ success: true, project });
         } catch (error) {
             res.status(500).json({ success: false, error: error.message });
@@ -31,7 +32,12 @@ class ProjectController {
 
         try {
             const commit = await projectService.createCommit(name, {
-                message, snapshot, diff, prevCommitId, branchName, author
+                message,
+                snapshot,
+                diff,
+                prevCommitId,
+                branchName,
+                author
             });
             res.json({ success: true, commitId: commit.id });
         } catch (error) {
@@ -42,6 +48,7 @@ class ProjectController {
     async getLatestCommit(req, res) {
         const { name } = req.params;
         const { branch } = req.query;
+
         try {
             const commit = await projectService.getLatestCommit(name, branch);
             res.json({ commit });
@@ -52,6 +59,7 @@ class ProjectController {
 
     async getCommitById(req, res) {
         const { name, commitId } = req.params;
+
         try {
             const commit = await projectService.getCommitById(name, commitId);
             if (!commit) return res.status(404).json({ error: 'Commit not found' });
@@ -63,11 +71,23 @@ class ProjectController {
 
     async getLog(req, res) {
         const { name } = req.params;
+
         try {
             const commits = await projectService.getCommitLog(name);
             res.json({ commits });
         } catch (error) {
             res.status(500).json({ error: error.message });
+        }
+    }
+
+    async rollback(req, res) {
+        try {
+            const { name, commitId } = req.params;
+            await projectService.rollbackProject(name, commitId);
+            res.json({ message: 'Rollback successful' });
+        } catch (error) {
+            console.error('Rollback error:', error);
+            res.status(500).json({ error: error.message, stack: error.stack });
         }
     }
 }

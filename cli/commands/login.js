@@ -3,7 +3,6 @@ const chalk = require('chalk');
 const configManager = require('../utils/config');
 const apiService = require('../services/api');
 
-// Using the official GitHub CLI Client ID which has Device Flow enabled by default
 const CLIENT_ID = '178c6fc778ccc68e1d6a';
 
 module.exports = async function login() {
@@ -11,7 +10,6 @@ module.exports = async function login() {
     console.log(chalk.gray('(This method works securely without requiring server secrets)\n'));
 
     try {
-        // 1. Request device code from GitHub
         let deviceRes;
         try {
             deviceRes = await axios.post('https://github.com/login/device/code', {
@@ -38,7 +36,6 @@ module.exports = async function login() {
         console.log(`1. Your Activation Code is: ${chalk.bold.green(user_code)}`);
         console.log(`2. Opening browser to: ${chalk.underline(verification_uri)}`);
 
-        // Open browser automatically
         try {
             const { default: openLink } = await import('open');
             await openLink(verification_uri);
@@ -48,7 +45,6 @@ module.exports = async function login() {
 
         console.log(`\n${chalk.yellow('Waiting for authorization...')}`);
 
-        // 3. Poll for the token
         let token = null;
         const startTime = Date.now();
         const pollInterval = (interval || 5) * 1000;
@@ -77,12 +73,10 @@ module.exports = async function login() {
                 } else if (pollRes.data.error === 'slow_down') {
                     await new Promise(resolve => setTimeout(resolve, 5000));
                 } else {
-                    // unexpected error
                     throw new Error(pollRes.data.error_description || pollRes.data.error);
                 }
             } catch (pollErr) {
-                // Ignore network glitches during polling unless it's a real error
-                if (pollErr.response && pollErr.response.data && pollErr.response.data.error !== 'authorization_pending') {
+                if (pollErr.response?.data?.error !== 'authorization_pending') {
                     throw pollErr;
                 }
             }
@@ -90,21 +84,19 @@ module.exports = async function login() {
 
         console.log(chalk.blue('\n📡  Verifying with remote server...'));
 
-        // 4. Send GitHub token to our backend to get a local JWT
         await apiService.init();
         const baseURL = apiService.client.defaults.baseURL || 'http://localhost:3000';
 
-        // Exchange endpoint on our server (does NOT need secret, just validates token)
         const serverRes = await axios.post(`${baseURL}/auth/exchange`, {
             github_token: token
         });
 
         const jwt = serverRes.data.token;
 
-        // 5. Save the JWT to config
-        const currentConfig = configManager.getConfig() || {};
-        configManager.saveConfig({
-            ...currentConfig,
+        // ✅ Save token to GLOBAL config so it's available across all projects
+        const currentGlobalConfig = configManager.getGlobalConfig() || {};
+        configManager.saveGlobalConfig({
+            ...currentGlobalConfig,
             token: jwt
         });
 
